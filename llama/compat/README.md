@@ -23,11 +23,15 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
 - `llama-ollama-compat-util.h`, `llama-ollama-compat-util.cpp` - helpers for
   KV edits, tensor renames, skip-prefix tracking, tensor load operations, and
   small tensor repacking primitives.
-- `llama-cpp-hooks.patch` - small additive call-site edits in llama.cpp files.
+- `001-llama-cpp-hooks.patch` - small additive call-site edits in llama.cpp files.
   It currently touches `src/llama-model-loader.cpp` and `tools/mtmd/clip.cpp`.
-- `compat.cmake`, `apply-patch.cmake` - CMake glue and an idempotent applier
-  (used by `llama/server/CMakeLists.txt`) that applies every `*.patch` under
-  this directory — the hooks patch plus each `models/` architecture patch.
+- `002-llama-cpp-ui-empty-assets.patch` - lets the llama.cpp UI embed helper
+  generate an empty asset table when no UI assets are present.
+- `compat.cmake` - CMake glue that invokes the shared
+  `cmake/apply-git-patches.cmake` idempotent applier (used by
+  `llama/server/CMakeLists.txt`) for every `*.patch` under
+  this directory by numeric filename order — the hooks patch plus each
+  `models/` architecture patch.
 - `models/` - the sibling **new-architecture** layer: implementations of
   architectures llama.cpp doesn't support yet, each added via a small
   registration patch. (Those files *add* archs; the files above *translate*
@@ -85,6 +89,7 @@ This table tracks the dispatch surface. Keep it brief; the handler comments in
 | `deepseekocr` | Maps to `deepseek2-ocr`, injects missing OCR/MoE metadata, and hides embedded SAM/vision/projector tensors. | DeepSeek OCR projector translation. |
 | `glmocr` | Maps GLM OCR metadata/tensors to the llama.cpp-compatible view. | GLM OCR projector translation. |
 | `glm4moelite` | Maps GLM-4.7 Flash MLA metadata to the `deepseek2` path and fixes special-token metadata. | n/a |
+| `laguna` | Renames legacy attention-gate tensors and SWA RoPE metadata to current llama.cpp names. | n/a |
 | `nemotron_h_moe` | Fixes latent-FFN variants and hides MTP tensors. | n/a |
 | `nemotron_h_omni` | Selects the Nemotron text loader and hides audio/vision/projector tensors from the text loader. | Nemotron V2 VL projector translation; audio remains disabled. |
 | `llama` with Llama 3 markers | Fixes Llama 3 tokenizer metadata. | n/a |
@@ -116,7 +121,7 @@ cd /path/to/llama.cpp
 git diff -- \
     src/llama-model-loader.cpp \
     tools/mtmd/clip.cpp \
-    > /path/to/ollama/llama/compat/llama-cpp-hooks.patch
+    > /path/to/ollama/llama/compat/001-llama-cpp-hooks.patch
 ```
 
 ## Implementation Notes

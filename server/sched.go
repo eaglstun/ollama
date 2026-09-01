@@ -23,7 +23,6 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/types/model"
-	"github.com/ollama/ollama/x/imagegen"
 	"github.com/ollama/ollama/x/mlxrunner"
 )
 
@@ -127,19 +126,24 @@ func schedulerModelKey(m *Model) string {
 	return ""
 }
 
-// context must be canceled to decrement ref count and release the runner
-func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration) (chan *runnerRef, chan error) {
-	return s.getRunner(c, m, opts, sessionDuration, false, false, nil)
-}
-
-const contextShiftSmallContextLimit = 8192
-
-func resolveContextShift(shift *bool, numCtx int) bool {
+func resolveContextShift(shift *bool, m *Model) bool {
 	if shift != nil {
 		return *shift
 	}
 
-	return numCtx > 0 && numCtx < contextShiftSmallContextLimit
+	return supportsContextShift(m)
+}
+
+func supportsContextShift(m *Model) bool {
+	if m == nil {
+		return true
+	}
+
+	if m.Config.ModelFamily == "deepseek2" || slices.Contains(m.Config.ModelFamilies, "deepseek2") {
+		return false
+	}
+
+	return true
 }
 
 func effectiveModelContext(numCtx int, f *ggml.GGML) int {
@@ -174,7 +178,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 
 	contextShift := false
 	if m.ModelPath != "" {
-		contextShift = resolveContextShift(shift, opts.NumCtx)
+		contextShift = resolveContextShift(shift, m)
 	}
 
 	req := &LlmRequest{
@@ -566,7 +570,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			}
 
 			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
-			req.contextShift = resolveContextShift(req.shift, effectiveModelContext(launchOpts.NumCtx, f))
+			req.contextShift = resolveContextShift(req.shift, req.model)
 
 			config := llamaServerConfigForModel(req.model)
 			config.ContextShift = req.contextShift
@@ -581,11 +585,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			}
 		} else {
 			modelName := req.model.ShortName
-			if slices.Contains(req.model.Config.Capabilities, "image") {
-				llama, err = imagegen.NewServer(modelName)
-			} else {
-				llama, err = mlxrunner.NewClient(modelName)
-			}
+			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
 		}
 		if err != nil {
 			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
@@ -691,7 +691,7 @@ iGPUScan:
 	trainContext := modelTrainContext(f)
 	if effectiveNumCtx := llama.ContextLength(); req.model.ModelPath != "" && effectiveNumCtx > 0 {
 		req.opts.NumCtx = effectiveNumCtx
-		req.contextShift = resolveContextShift(req.shift, effectiveNumCtx)
+		req.contextShift = resolveContextShift(req.shift, req.model)
 	}
 	runner := &runnerRef{
 		model:           req.model,
@@ -702,7 +702,6 @@ iGPUScan:
 		sessionDuration: sessionDuration,
 		gpus:            gpuIDs,
 		discreteGPUs:    discreteGPUs,
-		isImagegen:      slices.Contains(req.model.Config.Capabilities, "image"),
 		totalSize:       totalSize,
 		vramSize:        vramSize,
 		loading:         true,
@@ -1345,7 +1344,6 @@ type runnerRef struct {
 	loading      bool          // True only during initial load, then false forever
 	gpus         []ml.DeviceID // Recorded at time of provisioning
 	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
-	isImagegen   bool          // True if loaded via imagegen runner (vs mlxrunner)
 	vramSize     uint64
 	totalSize    uint64
 
@@ -1385,12 +1383,6 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 
-	// Check if runner type (imagegen vs mlxrunner) matches what's requested.
-	wantImagegen := slices.Contains(req.model.Config.Capabilities, "image")
-	if runner.isImagegen != wantImagegen {
-		return true
-	}
-
 	timeout := 10 * time.Second
 	if runner.loading {
 		timeout = 2 * time.Minute // Initial load can take a long time for big models on slow systems...
@@ -1420,7 +1412,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 
 	contextShift := req.contextShift
 	if req.model.ModelPath != "" {
-		contextShift = resolveContextShift(req.shift, optsNew.NumCtx)
+		contextShift = resolveContextShift(req.shift, req.model)
 	}
 	if runner.contextShift != contextShift {
 		return true
@@ -1736,4 +1728,58 @@ func (s *Scheduler) expireRunner(model *Model) {
 		}
 		runner.refMu.Unlock()
 	}
+}
+
+// loadedModel is a point-in-time snapshot of a loaded runner's state, safe to
+// use without holding any scheduler locks.
+type loadedModel struct {
+	model         *Model
+	size          int64
+	sizeVRAM      int64
+	contextLength int
+	expiresAt     time.Time
+}
+
+// loadedModels returns a snapshot of the currently loaded models for status
+// reporting without exposing the scheduler's internal runner bookkeeping.
+func (s *Scheduler) loadedModels() []loadedModel {
+	s.loadedMu.Lock()
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, r := range s.loaded {
+		runners = append(runners, r)
+	}
+	s.loadedMu.Unlock()
+
+	// refMu must not be acquired while holding loadedMu: the expiration path
+	// locks them in the opposite order.
+	models := make([]loadedModel, 0, len(runners))
+	for _, r := range runners {
+		r.refMu.Lock()
+		if r.model == nil {
+			// Unloaded after the snapshot above was taken
+			r.refMu.Unlock()
+			continue
+		}
+		lm := loadedModel{
+			model:     r.model,
+			size:      int64(r.totalSize),
+			sizeVRAM:  int64(r.vramSize),
+			expiresAt: r.expiresAt,
+		}
+		if r.llama != nil {
+			lm.contextLength = r.llama.ContextLength()
+			total, vram := r.llama.MemorySize()
+			lm.size = int64(total)
+			lm.sizeVRAM = int64(vram)
+		}
+		// The scheduler waits to set expiresAt, so a model that is still
+		// loading may have the zero value. Estimate expiration from the
+		// session duration instead.
+		if lm.expiresAt.IsZero() {
+			lm.expiresAt = time.Now().Add(r.sessionDuration)
+		}
+		r.refMu.Unlock()
+		models = append(models, lm)
+	}
+	return models
 }

@@ -43,8 +43,12 @@ func TestFromValues(t *testing.T) {
 }
 
 func TestComparisonOpsAndBernoulli(t *testing.T) {
-	skipIfNoMLX(t)
+	withMLXThread(t, func() {
+		testComparisonOpsAndBernoulli(t)
+	})
+}
 
+func testComparisonOpsAndBernoulli(t *testing.T) {
 	a := FromValues([]float32{1, 2, 3}, 3)
 	b := FromValues([]float32{1, 1, 4}, 3)
 	eq := a.Equal(b).AsType(DTypeInt32)
@@ -54,13 +58,13 @@ func TestComparisonOpsAndBernoulli(t *testing.T) {
 	Eval(eq, gt, le, bern)
 
 	for name, tc := range map[string]struct {
-		got  []int
-		want []int
+		got  []int32
+		want []int32
 	}{
-		"equal":     {eq.Ints(), []int{1, 0, 0}},
-		"greater":   {gt.Ints(), []int{0, 1, 0}},
-		"lessEqual": {le.Ints(), []int{1, 0, 1}},
-		"bernoulli": {bern.Ints(), []int{1, 0}},
+		"equal":     {eq.Ints(), []int32{1, 0, 0}},
+		"greater":   {gt.Ints(), []int32{0, 1, 0}},
+		"lessEqual": {le.Ints(), []int32{1, 0, 1}},
+		"bernoulli": {bern.Ints(), []int32{1, 0}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if len(tc.got) != len(tc.want) {
