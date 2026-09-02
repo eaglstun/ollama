@@ -19,3 +19,11 @@ go run . serve
 
 See `docs/development.md` for prerequisites, platform notes, GPU backends, and
 the full development workflow.
+
+## Fork-local: the talkie-1930 architecture
+
+This fork carries a custom architecture, `TalkieForCausalLM`, in `x/models/talkie/`, which
+stock ollama does not have. If the task involves talkie, or `ollama run talkie-1930` fails
+with `unsupported architecture: TalkieForCausalLM`, read
+[`x/models/talkie/README.md`](x/models/talkie/README.md) first. It is the build, serve, and
+verify runbook.

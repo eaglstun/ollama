@@ -8,6 +8,61 @@
 
 Start building with open models.
 
+## About this fork
+
+This is a personal fork of [ollama/ollama](https://github.com/ollama/ollama). It exists for
+one reason: to teach ollama's MLX runner an architecture that upstream has never heard of.
+
+**talkie-1930** is a from-scratch decoder-only transformer trained on a corpus that stops in
+1930 — it answers questions about the wireless telephone the way 1930 would, because nothing
+after 1930 is in it. Its architecture is registered as `TalkieForCausalLM`, which is not a
+Hugging Face standard and is not in upstream ollama. Run the model on a stock build and you
+get:
+
+```
+Error: mlx runner failed: Error: unsupported architecture: TalkieForCausalLM
+```
+
+This fork adds that architecture. That is the whole point of the fork.
+
+### What it changes
+
+Everything not listed here is upstream, unmodified. The fork tracks `upstream/main`.
+
+| Path                                   | What it is                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------ |
+| `x/models/talkie/talkie.go`            | The architecture, for the MLX runner. Self-registers as `TalkieForCausalLM`.   |
+| `x/mlxrunner/imports.go`               | One import line, to link the registration into the runner.                     |
+| `x/models/talkie/convert_tokenizer.py` | Converts talkie's tokenizer into the form the runner expects.                  |
+| `.agents/skills/`                      | Two local agent skills: throughput A/B benchmarking, sampling-preset auditing. |
+| `docs/modelfile.mdx`                   | Documentation fix: the default seed is `-1`.                                   |
+
+The port loads talkie's original checkpoint tensor names unchanged (`embed.weight`,
+`blocks.N.attn.attn_query.weight`, `blocks.N.attn.head_gain.head_g`) rather than remapping
+them to Llama conventions, and it mirrors the reference PyTorch and MLX implementations.
+
+Two details are not negotiable, and both will produce a model that loads cleanly and then
+talks nonsense if you get them wrong:
+
+- **RMSNorm is weightless and computed in fp32** with float32 machine epsilon. There are no
+  `*norm.weight` tensors in the checkpoint; there is no learned gamma to find.
+- **RoPE rotates with the opposite sign** from standard NeoX, so the rotation is applied by
+  hand instead of through `mlx.RoPEWithBase`.
+
+Both are documented in the package comment at the top of `x/models/talkie/talkie.go`.
+
+### Using it
+
+The architecture only exists in a binary built from this fork. A Homebrew or downloaded
+ollama will not run talkie-1930 no matter how the model is imported — build from source and
+serve the model from the result.
+
+Build and install steps, including how to run the fork's server alongside an existing
+Homebrew ollama without evicting it, are in **[`x/models/talkie/README.md`](x/models/talkie/README.md)**.
+
+For everything else — every other model, every other feature — this behaves exactly like
+upstream ollama, documented below.
+
 ## Download
 
 ### macOS
@@ -55,7 +110,7 @@ The official [Ollama Docker image](https://hub.docker.com/r/ollama/ollama) `olla
 ollama
 ```
 
-You'll be prompted to run a model or connect Ollama to your existing agents or applications such as `Claude Code`, `OpenClaw`, `OpenCode` , `Codex`, `Copilot`,  and more.
+You'll be prompted to run a model or connect Ollama to your existing agents or applications such as `Claude Code`, `OpenClaw`, `OpenCode` , `Codex`, `Copilot`, and more.
 
 ### Coding
 

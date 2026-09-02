@@ -254,7 +254,7 @@ func (m *Model) rope(x, posIdx *mlx.Array, B, L int32) *mlx.Array {
 	return mlx.Concatenate([]*mlx.Array{y1, y2}, 3)
 }
 
-func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
+func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 
@@ -277,7 +277,11 @@ func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
 		}
 		h = layer.Forward(m, h, eX, b, c, posIdx, B, L)
 	}
-	return rmsNorm(h)
+
+	// talkie has no draft/multi-token-prediction head, so the auxiliary hidden
+	// state is just the final hidden state, as in the other dense archs.
+	out := rmsNorm(h)
+	return out, out
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
