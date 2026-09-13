@@ -154,13 +154,13 @@ func TestContextShiftPromptLimit(t *testing.T) {
 func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 	// Simulate llama-server SSE streaming response
 	sseLines := []string{
-		`data: {"content":"Hello","stop":false}`,
+		`data: {"content":"Hello","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":1,"predicted_ms":9.1}}`,
 		``,
 		`:`,
-		`data: {"content":" world","stop":false}`,
+		`data: {"content":" world","stop":false,"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3}}`,
 		``,
 		`:`,
-		`data: {"content":"","stop":true,"stop_type":"eos","timings":{"prompt_n":5,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3}}`,
+		`data: {"content":"","stop":true,"stop_type":"eos","timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3}}`,
 		``,
 	}
 
@@ -186,6 +186,9 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 		if !reqBody.Stream {
 			t.Error("stream should be true")
 		}
+		if !reqBody.TimingsPerToken {
+			t.Error("timings_per_token should be true")
+		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		for _, line := range sseLines {
@@ -208,8 +211,9 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 	var responses []CompletionResponse
 	opts := api.DefaultOptions()
 	err := runner.Completion(t.Context(), CompletionRequest{
-		Prompt:  "test prompt",
-		Options: &opts,
+		Prompt:                     "test prompt",
+		Options:                    &opts,
+		IncludeIntermediateMetrics: true,
 	}, func(cr CompletionResponse) {
 		responses = append(responses, cr)
 	})
@@ -228,10 +232,28 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 	if responses[0].Done {
 		t.Error("response[0] should not be done")
 	}
+	if responses[0].PromptEvalCount != 5 || responses[0].EvalCount != 1 {
+		t.Errorf("response[0] counts = (%d, %d), want (5, 1)", responses[0].PromptEvalCount, responses[0].EvalCount)
+	}
+	if got := responses[0].PromptEvalCachedCount; got == nil || *got != 2 {
+		t.Errorf("response[0] cached prompt count = %v, want 2", got)
+	}
+	if responses[0].PromptEvalDuration != 10500*time.Microsecond || responses[0].EvalDuration != 9100*time.Microsecond {
+		t.Errorf("response[0] durations = (%s, %s), want (10.5ms, 9.1ms)", responses[0].PromptEvalDuration, responses[0].EvalDuration)
+	}
 
 	// Second token
 	if responses[1].Content != " world" {
 		t.Errorf("response[1].Content = %q, want %q", responses[1].Content, " world")
+	}
+	if responses[1].PromptEvalCount != 5 || responses[1].EvalCount != 2 {
+		t.Errorf("response[1] counts = (%d, %d), want (5, 2)", responses[1].PromptEvalCount, responses[1].EvalCount)
+	}
+	if got := responses[1].PromptEvalCachedCount; got == nil || *got != 2 {
+		t.Errorf("response[1] cached prompt count = %v, want 2", got)
+	}
+	if responses[1].PromptEvalDuration != 10500*time.Microsecond || responses[1].EvalDuration != 20300*time.Microsecond {
+		t.Errorf("response[1] durations = (%s, %s), want (10.5ms, 20.3ms)", responses[1].PromptEvalDuration, responses[1].EvalDuration)
 	}
 
 	// Final response
@@ -243,6 +265,9 @@ func TestLlamaServerCompletionSSEParsing(t *testing.T) {
 	}
 	if responses[2].PromptEvalCount != 5 {
 		t.Errorf("PromptEvalCount = %d, want 5", responses[2].PromptEvalCount)
+	}
+	if got := responses[2].PromptEvalCachedCount; got == nil || *got != 2 {
+		t.Errorf("PromptEvalCachedCount = %v, want 2", got)
 	}
 	if responses[2].EvalCount != 2 {
 		t.Errorf("EvalCount = %d, want 2", responses[2].EvalCount)
@@ -290,6 +315,9 @@ func TestLlamaServerCompletionPromptEvalCountIncludesCache(t *testing.T) {
 	}
 	if responses[0].PromptEvalCount != 17 {
 		t.Errorf("PromptEvalCount = %d, want 17", responses[0].PromptEvalCount)
+	}
+	if got := responses[0].PromptEvalCachedCount; got == nil || *got != 12 {
+		t.Errorf("PromptEvalCachedCount = %v, want 12", got)
 	}
 	if responses[0].PromptEvalDuration != 10*time.Millisecond {
 		t.Errorf("PromptEvalDuration = %s, want 10ms", responses[0].PromptEvalDuration)
@@ -340,6 +368,9 @@ func TestLlamaServerChatPromptEvalCountIncludesCache(t *testing.T) {
 	}
 	if responses[1].PromptEvalCount != 17 {
 		t.Errorf("PromptEvalCount = %d, want 17", responses[1].PromptEvalCount)
+	}
+	if got := responses[1].PromptEvalCachedCount; got == nil || *got != 12 {
+		t.Errorf("PromptEvalCachedCount = %v, want 12", got)
 	}
 	if responses[1].PromptEvalDuration != 10*time.Millisecond {
 		t.Errorf("PromptEvalDuration = %s, want 10ms", responses[1].PromptEvalDuration)
@@ -2164,6 +2195,7 @@ func TestAppendMMProjArgs(t *testing.T) {
 
 	tests := []struct {
 		name         string
+		modelArch    string
 		projectors   []string
 		opts         api.Options
 		gpus         []ml.DeviceInfo
@@ -2268,12 +2300,23 @@ func TestAppendMMProjArgs(t *testing.T) {
 			retry:        true,
 			want:         []string{"base", "--mmproj", "model.gguf", "--no-mmproj-offload"},
 		},
+		{
+			name:         "gemma3n keeps projector offload under partial text offload",
+			modelArch:    "gemma3n",
+			projectors:   []string{"model.gguf"},
+			opts:         partialOpts,
+			gpus:         []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}, FreeMemory: 24 << 30}},
+			mmprojMemory: 933 << 20,
+			modelLayers:  81,
+			want:         []string{"base", "--mmproj", "model.gguf"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := appendMMProjArgs([]string{"base"}, llamaServerLaunchConfig{
 				modelPath:            "model.gguf",
+				modelArch:            tt.modelArch,
 				projectors:           tt.projectors,
 				mmprojMemory:         tt.mmprojMemory,
 				opts:                 tt.opts,
@@ -2283,6 +2326,45 @@ func TestAppendMMProjArgs(t *testing.T) {
 			})
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("appendMMProjArgs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldRetryMMProjCPUOffload(t *testing.T) {
+	launch := func(modelArch string) llamaServerLaunchConfig {
+		return llamaServerLaunchConfig{
+			modelArch:    modelArch,
+			projectors:   []string{"mmproj.gguf"},
+			opts:         api.DefaultOptions(),
+			gpus:         []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}, FreeMemory: 24 << 30}},
+			mmprojMemory: 933 << 20,
+			modelLayers:  81,
+		}
+	}
+
+	tests := []struct {
+		name   string
+		launch llamaServerLaunchConfig
+		want   bool
+	}{
+		{
+			name:   "oom retries with projector on cpu",
+			launch: launch("qwen3vl"),
+			want:   true,
+		},
+		{
+			name:   "gemma3n oom does not retry with projector on cpu",
+			launch: launch("gemma3n"),
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &llamaServerRunner{launch: tt.launch}
+			if got := s.shouldRetryMMProjCPUOffload(errors.New("out of memory")); got != tt.want {
+				t.Fatalf("shouldRetryMMProjCPUOffload = %v, want %v", got, tt.want)
 			}
 		})
 	}

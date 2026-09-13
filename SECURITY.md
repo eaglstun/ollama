@@ -7,6 +7,7 @@ The Ollama maintainer team takes security seriously and will actively work to re
 If you discover a security vulnerability, please do not open a public issue. Instead, please report it by emailing hello@ollama.com. We ask that you give us sufficient time to investigate and address the vulnerability before disclosing it publicly.
 
 Please include the following details in your report:
+
 - A description of the vulnerability
 - Steps to reproduce the issue
 - Your assessment of the potential impact
