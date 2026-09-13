@@ -7,7 +7,9 @@ Point an agent at this file to get `ollama run talkie-1930` working again on thi
 **As of 2026-09-12 this is done.** The fork is built, a fork server is running, and both
 `talkie-1930` and `talkie-1930-sys` generate correctly through it. It was first brought up on
 2026-09-02 and re-verified after the 2026-09-12 upstream sync, which bumped MLX, MLX-C, and
-llama.cpp. If you only need to _use_ talkie, skip to [Serve](#serve). The build sections
+llama.cpp. The same day, two decode fixes took it from 16.5 to 17.8 tok/s, and one of them
+brought the port's RMSNorm back in line with the reference, which changed the smoke-test
+answer (see [Verify](#verify)). If you only need to _use_ talkie, skip to [Serve](#serve). The build sections
 below are for rebuilding after an upstream sync or on a fresh machine. Read
 [the stale-checkout trap](#rebuilding-after-an-upstream-sync-the-stale-checkout-trap) before
 any rebuild that follows a sync.
@@ -36,8 +38,14 @@ Every command in this file that touches talkie is therefore prefixed with an exp
   state twice, since talkie has no draft/multi-token-prediction head. **If a future
   upstream sync breaks the build again, this interface is the first place to look.**
   The 2026-09-12 sync reworked MLX array lifetimes (scoped instead of pinned and swept)
-  and needed no change to `talkie.go`: the seeded smoke test in [Verify](#verify)
-  reproduced the 2026-09-02 output token for token.
+  and needed no change to `talkie.go`.
+- Two decode fixes landed on 2026-09-12 (branch `talkie-decode-speedups`; the research
+  behind them is in [`PERFORMANCE.md`](PERFORMANCE.md)). `lm_head_gain` is folded into
+  `lm_head` once at load instead of rescaling the whole 671 MB table every token, and
+  `rmsNorm` calls the fused `mlx.RMSNormFn(x, nil, rmsEps)`. The fused norm computes
+  `x * rsqrt(mean(x^2) + eps)`, which matches the MLX reference bit for bit. The port's
+  earlier hand-rolled `x / sqrt(mean(x^2) + eps)` did not, and the difference was large
+  enough to change the smoke-test answer. **Do not put the hand-rolled norm back.**
 - `x/mlxrunner/imports.go` already has `_ "github.com/ollama/ollama/x/models/talkie"`, so
   the registration is linked into the runner. No wiring step is needed.
 - The model is **already imported** into the shared store at `~/.ollama/models` as
@@ -185,12 +193,18 @@ OLLAMA_HOST=127.0.0.1:11435 ~/Documents/dev/ollama/ollama run talkie-1930 \
 ```
 
 A correct answer sounds like 1930: besieged garrisons, moving trains, skilled operators,
-lovers parted by sea. Verified output from 2026-09-02, at temperature 0.75 and seed 1930:
+lovers parted by sea. Expected output since 2026-09-12, at temperature 0.75 and seed 1930
+(217 tokens):
 
-> It might become an important means of communication between moving trains and fixed
-> stations... a commander could issue orders to his troops while on the march. In cases of
-> accident, aid could be speedily summoned; and, in times of war, intelligence could be
-> rapidly transmitted between various parts of a field of battle.
+> The wireless telephone might become a means of communication between moving trains and
+> fixed stations, or between ships at sea. It might enable a passenger in an express train
+> to speak to his friends at the place from which he started, or a mariner to hold converse
+> with the shore... The voice might be made audible from London to Paris, or from New York
+> to San Francisco.
+
+It ends: "...who shall venture to set bounds to the possible achievements of science, in an
+age which has seen railways and telegraphs established, and has heard of flying
+machines?--Chambers."
 
 `ollama run` cannot set a seed from the command line, so for an exact-match regression check
 after a rebuild, use the API with the same options:
@@ -204,11 +218,17 @@ curl -s http://127.0.0.1:11435/api/generate -d '{
 }'
 ```
 
-On 2026-09-12, after the upstream sync (MLX `0.32.2-27-g37c26e5`), this reproduced the
-2026-09-02 text above word for word and ran on to 157 tokens, ending: "The time may come when
-we shall no more think of travelling without a wireless telephone than without a time-table
-or a Bradshaw." Same seed, same tokens means the forward pass is unchanged. If a future sync
-changes the wording at this seed, find out why before trusting the build.
+This text dates from the 2026-09-12 RMSNorm fix. Before it, the port gave a different answer
+at this seed ("It might become an important means of communication between moving trains
+and fixed stations... a commander could issue orders to his troops while on the march",
+ending on a Bradshaw), because its hand-rolled norm had drifted from the reference. The
+fixed port matches the MLX reference: on this prompt the reference with its own norm and
+with the fused kernel gives identical first-token logprobs and the same greedy
+continuation, and swapping the old formula into the reference reproduces the old answer
+(details and script in [`PERFORMANCE.md`](PERFORMANCE.md#applied-items-1-and-2)).
+
+Same seed, same tokens means the forward pass is unchanged. If a rebuild changes the wording
+at this seed, find out why before trusting the build.
 
 For load and speed numbers, see [Throughput](#throughput). If the answer sounds like a 2020s
 assistant instead, something is loading the wrong weights. Compare against the known-good MLX
@@ -221,19 +241,23 @@ cd ~/Documents/AI/talkie
 
 ## Throughput
 
-Measured 2026-09-12 on the M4 Max (40-core GPU, 546 GB/s, 64 GB), both sides bf16, 200
+Measured 2026-09-12 on the M4 Max (40-core GPU, 546 GB/s nominal, 64 GB), all bf16, 200
 generated tokens, seed 42, one discarded warmup, 3 runs averaged:
 
-| engine                                   | gen tok/s | run range   |
-| ---------------------------------------- | --------- | ----------- |
-| this fork, `ollama-bench` on port 11435  | **16.28** | 16.20–16.34 |
-| standalone MLX reference (`talkie-mlx`)  | 14.82     | 14.80–14.84 |
-| memory-bandwidth ceiling (546 / 26.6 GB) | ~20.5     |             |
+| engine                                          | gen tok/s | run range   |
+| ----------------------------------------------- | --------- | ----------- |
+| this fork, both decode fixes                    | **17.80** | 17.76–17.82 |
+| this fork, `lm_head` fold only                  | 17.30     | 17.27–17.32 |
+| this fork, before the fixes                     | 16.46     | 16.42–16.52 |
+| standalone MLX reference (`bench_reference.py`) | 14.82     | 14.80–14.84 |
+| measured floor (25.9 GB at 467 GB/s, 55.4 ms)   | ~18.0     |             |
 
-The port is about 10% faster than the reference it mirrors and runs at about 80% of the
-bandwidth ceiling, so there is no obvious speed left on the table at bf16. The reference loses
-time sampling on the CPU in numpy every token. Load was 4.1 s, and 1.1 s with the weights
-already in the page cache.
+The fixes took decode from 60.8 to 56.2 ms per token, within about 1 ms of the floor. Bare
+matrix-vector products over this model's weights reach 467 GB/s on this GPU, not the 546
+nominal, so 55.4 ms per token is as fast as bf16 goes here. Going meaningfully faster means
+quantizing: int8 measured about 30 tok/s on the reference with small quality loss (item 3 in
+[`PERFORMANCE.md`](PERFORMANCE.md)). The reference loses time sampling on the CPU in numpy
+every token. Load was 4.1 s, and 1.1 s with the weights already in the page cache.
 
 To re-run the ollama side, point the repo's bench script at the fork. It defaults to the
 Homebrew port, where talkie does not exist:
@@ -293,13 +317,15 @@ To confirm the system slot is actually wired up rather than just producing plaus
 send the same prompt with a fixed `seed` twice, once with `system` and once without. The
 completions diverge if the template works, and are identical if the prompt is being dropped.
 
-Re-checked 2026-09-12 at temperature 0.75 and seed 1930. With no system prompt,
-`talkie-1930-sys` produced exactly the `talkie-1930` answer from [Verify](#verify) (157
-tokens, moving trains). With `"Thou art a stern Presbyterian minister of the gospel."` it
-diverged to ships at sea and a besieged garrison (124 tokens). The slot still works.
+Re-checked 2026-09-12 on the fixed build, at temperature 0.75 and seed 1930. With no system
+prompt, `talkie-1930-sys` produced exactly the `talkie-1930` answer from [Verify](#verify)
+(217 tokens, trains and ships at sea). With `"Thou art a stern Presbyterian minister of the
+gospel."` it diverged to ships of the same fleet and war-time use (143 tokens). The slot
+still works.
 
 A persona only steers this model if 1930 contained one. Verified 2026-09-02 through the
-fork on port 11435, same question and seed, only the system prompt changing:
+fork on port 11435, same question and seed, only the system prompt changing. These runs
+predate the RMSNorm fix, so the exact replies would differ today; the pattern is the point:
 
 | system prompt                 | reply length | what came back                          |
 | ----------------------------- | ------------ | --------------------------------------- |

@@ -67,8 +67,7 @@ type Config struct {
 type Model struct {
 	EmbedTokens nn.EmbeddingLayer
 	Layers      []*Layer
-	LMHead      *mlx.Array // raw [vocab, n_embd]; untied, not a Linear
-	LMHeadGain  *mlx.Array // scalar [1]
+	LMHead      *mlx.Array // [vocab, n_embd] with lm_head_gain folded in; untied, not a Linear
 
 	// Precomputed RoPE tables, shape [max_seq_len, head_dim/2].
 	CosTable *mlx.Array
@@ -169,12 +168,17 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		return fmt.Errorf("missing embed.weight")
 	}
 
-	if m.LMHead = tensors["lm_head"]; m.LMHead == nil {
+	lmHead, lmHeadGain := tensors["lm_head"], tensors["lm_head_gain.w_g"]
+	if lmHead == nil {
 		return fmt.Errorf("missing lm_head")
 	}
-	if m.LMHeadGain = tensors["lm_head_gain.w_g"]; m.LMHeadGain == nil {
+	if lmHeadGain == nil {
 		return fmt.Errorf("missing lm_head_gain.w_g")
 	}
+	// Fold the scalar gain into the table once instead of rescaling all
+	// vocab*n_embd entries every token as the reference does. The product is
+	// the same tensor the per-token multiply built, so logits are unchanged.
+	m.LMHead = mlx.Mul(lmHead, lmHeadGain)
 
 	for i := range m.NLayer {
 		p := fmt.Sprintf("blocks.%d", i)
@@ -229,14 +233,15 @@ func (m *Model) buildRoPE() {
 	m.SinTable = mlx.FromValues(sin, T, half).AsType(mlx.DTypeBFloat16)
 }
 
-// rmsNorm is weightless RMS normalisation over the last axis, computed in fp32
-// and cast back to bf16 (matches talkie's F.rms_norm with no weight).
+// rmsNorm is weightless RMS normalisation over the last axis (matches talkie's
+// F.rms_norm with no weight). The fused kernel with a nil weight accumulates in
+// fp32 and returns the input dtype, so the bf16 activations here come back bf16.
+// It computes x * rsqrt(mean(x^2) + eps), which matches the MLX reference's
+// _rms_norm bit for bit. Do not replace it with x / sqrt(mean(x^2) + eps): the
+// rounding difference compounds across 162 norms per token and moved the
+// first-token logprobs of the smoke-test prompt by up to 1.5 nats.
 func rmsNorm(x *mlx.Array) *mlx.Array {
-	axis := len(x.Dims()) - 1
-	xf := x.AsType(mlx.DTypeFloat32)
-	ms := mlx.Mean(mlx.Mul(xf, xf), axis, true)
-	denom := mlx.Add(ms, mlx.NewScalarArray(rmsEps)).Sqrt()
-	return mlx.Div(xf, denom).AsType(mlx.DTypeBFloat16)
+	return mlx.RMSNormFn(x, nil, rmsEps)
 }
 
 // rope applies talkie's half-rotation RoPE (negative-sign convention) to a
@@ -285,8 +290,7 @@ func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
-	w := mlx.Mul(m.LMHead, m.LMHeadGain) // [vocab, n_embd]
-	return mlx.Matmul(x, w.Transpose(1, 0))
+	return mlx.Matmul(x, m.LMHead.Transpose(1, 0))
 }
 
 func (m *Model) NumLayers() int { return len(m.Layers) }
