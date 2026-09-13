@@ -4,10 +4,13 @@ Point an agent at this file to get `ollama run talkie-1930` working again on thi
 
 ## Current state: built and working
 
-**As of 2026-09-02 this is done.** The fork is built, a fork server is running, and both
-`talkie-1930` and `talkie-1930-sys` generate correctly through it. If you only need to _use_
-talkie, skip to [Serve](#serve). The build sections below are for rebuilding after an
-upstream sync or on a fresh machine.
+**As of 2026-09-12 this is done.** The fork is built, a fork server is running, and both
+`talkie-1930` and `talkie-1930-sys` generate correctly through it. It was first brought up on
+2026-09-02 and re-verified after the 2026-09-12 upstream sync, which bumped MLX, MLX-C, and
+llama.cpp. If you only need to _use_ talkie, skip to [Serve](#serve). The build sections
+below are for rebuilding after an upstream sync or on a fresh machine. Read
+[the stale-checkout trap](#rebuilding-after-an-upstream-sync-the-stale-checkout-trap) before
+any rebuild that follows a sync.
 
 The one thing that is **not** done, deliberately, is putting the fork on `PATH`. So this
 still fails, and will keep failing:
@@ -32,6 +35,9 @@ Every command in this file that touches talkie is therefore prefixed with an exp
   fixed on 2026-09-02 to match. Like the other dense archs it returns the final hidden
   state twice, since talkie has no draft/multi-token-prediction head. **If a future
   upstream sync breaks the build again, this interface is the first place to look.**
+  The 2026-09-12 sync reworked MLX array lifetimes (scoped instead of pinned and swept)
+  and needed no change to `talkie.go`: the seeded smoke test in [Verify](#verify)
+  reproduced the 2026-09-02 output token for token.
 - `x/mlxrunner/imports.go` already has `_ "github.com/ollama/ollama/x/models/talkie"`, so
   the registration is linked into the runner. No wiring step is needed.
 - The model is **already imported** into the shared store at `~/.ollama/models` as
@@ -41,7 +47,7 @@ Every command in this file that touches talkie is therefore prefixed with an exp
 
 ## Prerequisites
 
-Verified present on this machine as of 2026-09-02:
+Verified present on this machine as of 2026-09-12:
 
 | Requirement     | State                                            |
 | --------------- | ------------------------------------------------ |
@@ -49,7 +55,7 @@ Verified present on this machine as of 2026-09-02:
 | Ninja           | yes, `/opt/homebrew/bin/ninja`                   |
 | Xcode           | yes, 26.6                                        |
 | Metal toolchain | yes, `xcrun -sdk macosx metal --version` answers |
-| Disk headroom   | yes, ~960 GB free                                |
+| Disk headroom   | yes, ~858 GB free                                |
 | **Go 1.26+**    | yes, 1.27.1                                      |
 
 If `xcrun -sdk macosx metal --version` ever stops answering, run
@@ -72,6 +78,59 @@ This produces the `ollama` binary at the repo root and the native runtime payloa
 here.
 
 Expect this to take a while on a cold cache. It compiles llama.cpp and MLX from source.
+
+The build's exit status is the only reliable signal. If you pipe it through `tail` or
+background it behind an `echo`, check the log for `make: *** [all] Error` rather than
+trusting a zero exit.
+
+### Rebuilding after an upstream sync: the stale-checkout trap
+
+When a sync changes `LLAMA_CPP_VERSION`, `MLX_VERSION`, or `MLX_C_VERSION`, the next build
+can die a few minutes in with:
+
+```
+CMake Error at .../build/ollama-llama-cpp-source-prefix/tmp/ollama-llama-cpp-source-gitupdate.cmake:301 (message):
+  Failed to unstash changes in:
+  '/Users/eeaglstun/Documents/dev/ollama/build/_deps/llama_cpp-src'.
+```
+
+The dependencies are git checkouts under `build/_deps/`, and CMake's update step stashes any
+local edits, checks out the new pin, and tries to pop the stash back on top. The edits in
+there are almost always the build's own patches for the _old_ pin, so they no longer fit, the
+pop fails, and CMake rolls the checkout back to the old commit and stops. It fails on one
+dependency per run, so a sync that bumps two of them fails twice in a row.
+
+Check all three checkouts before rebuilding:
+
+```sh
+cd ~/Documents/dev/ollama
+for d in build/_deps/*-src; do echo "== $d"; git -C "$d" status --short; done
+```
+
+Do not blindly reset a dirty checkout. Identify the edits first:
+
+- **`llama_cpp-src`** is patched by the build, from `llama/compat/001-llama-cpp-hooks.patch`
+  and `llama/compat/models/*.patch`. Confirm the dirt is exactly those patches as they stood
+  _before_ the sync (take them from the pre-sync commit with `git show <old-sha>:<path>`):
+
+  ```sh
+  git -C build/_deps/llama_cpp-src apply --reverse --check /path/to/old.patch
+  ```
+
+  If every dirty file is accounted for, reset those files with `git checkout -- <files>` and
+  rebuild. The build re-applies the current patches to the new pin by itself.
+
+- **`mlx-c-src`** has no patch step at all, so any dirt there was put in by hand. On
+  2026-09-12 it was a shim that let the old MLX-C bindings (`fba4470`) compile against a
+  newer MLX: a `force_fused` argument on `mlx_fast_scaled_dot_product_attention` and a
+  cache argument on the `compile_clear_cache`/`compile_erase` calls. The new pin
+  (`c74db53`) ships both APIs properly, so the shim was dropped. For any future dirt, check
+  whether the new pin already covers it (`git -C build/_deps/mlx-c-src show <new-pin>:<file>`)
+  before throwing it away, and ask the human if it does not.
+
+- **`mlx-src`** was clean on 2026-09-12.
+
+These are gitignored build checkouts, so nothing here touches the repo itself.
 
 ## Serve
 
@@ -133,9 +192,28 @@ lovers parted by sea. Verified output from 2026-09-02, at temperature 0.75 and s
 > accident, aid could be speedily summoned; and, in times of war, intelligence could be
 > rapidly transmitted between various parts of a field of battle.
 
-Cold load was about 6 seconds. If the answer sounds like a 2020s assistant instead, something
-is loading the wrong weights. Compare against the known-good MLX reference, which does not
-involve ollama at all:
+`ollama run` cannot set a seed from the command line, so for an exact-match regression check
+after a rebuild, use the API with the same options:
+
+```sh
+curl -s http://127.0.0.1:11435/api/generate -d '{
+  "model": "talkie-1930",
+  "prompt": "What might the wireless telephone one day become?",
+  "stream": false,
+  "options": {"temperature": 0.75, "seed": 1930}
+}'
+```
+
+On 2026-09-12, after the upstream sync (MLX `0.32.2-27-g37c26e5`), this reproduced the
+2026-09-02 text above word for word and ran on to 157 tokens, ending: "The time may come when
+we shall no more think of travelling without a wireless telephone than without a time-table
+or a Bradshaw." Same seed, same tokens means the forward pass is unchanged. If a future sync
+changes the wording at this seed, find out why before trusting the build.
+
+Cold load was about 6 seconds on 2026-09-02 and about 11 seconds on 2026-09-12. Generation on
+2026-09-12 ran at 9.2 tok/s on the M4 Max. Neither number has been investigated. If the answer
+sounds like a 2020s assistant instead, something is loading the wrong weights. Compare against
+the known-good MLX reference, which does not involve ollama at all:
 
 ```sh
 cd ~/Documents/AI/talkie
@@ -171,6 +249,11 @@ curl -s http://127.0.0.1:11435/api/generate -d '{
 To confirm the system slot is actually wired up rather than just producing plausible prose,
 send the same prompt with a fixed `seed` twice, once with `system` and once without. The
 completions diverge if the template works, and are identical if the prompt is being dropped.
+
+Re-checked 2026-09-12 at temperature 0.75 and seed 1930. With no system prompt,
+`talkie-1930-sys` produced exactly the `talkie-1930` answer from [Verify](#verify) (157
+tokens, moving trains). With `"Thou art a stern Presbyterian minister of the gospel."` it
+diverged to ships at sea and a besieged garrison (124 tokens). The slot still works.
 
 A persona only steers this model if 1930 contained one. Verified 2026-09-02 through the
 fork on port 11435, same question and seed, only the system prompt changing:
