@@ -210,15 +210,58 @@ we shall no more think of travelling without a wireless telephone than without a
 or a Bradshaw." Same seed, same tokens means the forward pass is unchanged. If a future sync
 changes the wording at this seed, find out why before trusting the build.
 
-Cold load was about 6 seconds on 2026-09-02 and about 11 seconds on 2026-09-12. Generation on
-2026-09-12 ran at 9.2 tok/s on the M4 Max. Neither number has been investigated. If the answer
-sounds like a 2020s assistant instead, something is loading the wrong weights. Compare against
-the known-good MLX reference, which does not involve ollama at all:
+For load and speed numbers, see [Throughput](#throughput). If the answer sounds like a 2020s
+assistant instead, something is loading the wrong weights. Compare against the known-good MLX
+reference, which does not involve ollama at all:
 
 ```sh
 cd ~/Documents/AI/talkie
 .venv/bin/talkie-mlx --model-dir ~/models/talkie-1930-13b-it-mlx --max-tokens 70 "..."
 ```
+
+## Throughput
+
+Measured 2026-09-12 on the M4 Max (40-core GPU, 546 GB/s, 64 GB), both sides bf16, 200
+generated tokens, seed 42, one discarded warmup, 3 runs averaged:
+
+| engine                                   | gen tok/s | run range   |
+| ---------------------------------------- | --------- | ----------- |
+| this fork, `ollama-bench` on port 11435  | **16.28** | 16.20–16.34 |
+| standalone MLX reference (`talkie-mlx`)  | 14.82     | 14.80–14.84 |
+| memory-bandwidth ceiling (546 / 26.6 GB) | ~20.5     |             |
+
+The port is about 10% faster than the reference it mirrors and runs at about 80% of the
+bandwidth ceiling, so there is no obvious speed left on the table at bf16. The reference loses
+time sampling on the CPU in numpy every token. Load was 4.1 s, and 1.1 s with the weights
+already in the page cache.
+
+To re-run the ollama side, point the repo's bench script at the fork. It defaults to the
+Homebrew port, where talkie does not exist:
+
+```sh
+HOST=http://127.0.0.1:11435 PROMPT="Write a long and detailed essay upon the future of the railways." \
+  .agents/skills/ollama-bench/scripts/bench.sh talkie-1930
+```
+
+It reports prefill as 0 for talkie because the warmup caches the prompt, so the measured runs
+skip prefill entirely. The reference side has no timer of its own. It is timed with
+[`bench_reference.py`](bench_reference.py), a small harness around `MLXTalkie._generate_ids`
+with stop tokens disabled so every run reaches 200. Run it from the reference venv:
+
+```sh
+cd ~/Documents/AI/talkie
+.venv/bin/python ~/Documents/dev/ollama/x/models/talkie/bench_reference.py
+```
+
+**Benchmark only on an idle machine.** Check that neither server is busy first:
+
+```sh
+curl -s http://127.0.0.1:11434/api/ps; curl -s http://127.0.0.1:11435/api/ps
+```
+
+A first measurement on 2026-09-12 ran while the Homebrew server was in use and came back at
+9.2 tok/s with an 11 s load. Both numbers were contention, not the model, and they briefly
+made it into this file as fact.
 
 ## The system-prompt slot (done, kept here as reference)
 
